@@ -1,0 +1,172 @@
+// ==UserScript==
+// @name         Kryptex – Profitability forintban (MNB)
+// @namespace    local.kryptex.mnb.huf
+// @version      1.2.1
+// @description  Forintos havi és napi összeg az eurós Profitability alatt, MNB-árfolyammal.
+// @match        https://www.kryptex.com/site/hardware*
+// @match        https://kryptex.com/site/hardware*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      www.mnb.hu
+// @run-at       document-idle
+// @sandbox      DOM
+// @noframes
+// ==/UserScript==
+
+(() => {
+    'use strict';
+
+    const HOUR = 60 * 60 * 1000;
+    const KEY = 'mnb-eur-huf-v1';
+    const CLASS = 'kryptex-mnb-huf';
+    const format = new Intl.NumberFormat('hu-HU', {
+        minimumFractionDigits: 2, maximumFractionDigits: 2
+    });
+    const rows = new Map();
+    const status = document.createElement('div');
+    status.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:2147483647;padding:10px 14px;border:1px solid #b8c5d8;border-radius:8px;background:#fff;color:#182235;font:13px/1.5 system-ui;max-width:340px;box-shadow:0 2px 12px #0002;';
+    status.textContent = 'Kryptex HUF 1.2: elindult, eurós mező keresése…';
+    document.documentElement.append(status);
+    let rate = null;
+    try { rate = GM_getValue(KEY, null); }
+    catch (error) { console.warn('[Kryptex MNB HUF] A mentett árfolyam nem olvasható.', error); }
+    if (!rate || !Number.isFinite(rate.value) || rate.value <= 0 ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(rate.date) || !Number.isFinite(rate.fetchedAt)) rate = null;
+    let failed = false;
+    let lastError = '';
+    let busy = false;
+    let nextAttempt = 0;
+    let scheduled = false;
+
+    // Kryptex angol számformátuma: 1436.45 vagy 1,436.45.
+    function amounts(text) {
+        const number = '(-?(?:\\d{1,3}(?:,\\d{3})+|\\d+)(?:\\.\\d+)?)';
+        const match = text.replace(/[\u200B-\u200D\uFEFF]/g, '').trim().match(new RegExp(
+            '^€\\s*' + number + '\\s*/mo\\s*·\\s*€\\s*' + number + '\\s*/d$'
+        ));
+        if (!match) return null;
+        const values = match.slice(1).map(x => Number(x.replace(/,/g, '')));
+        return values.every(Number.isFinite) ? values : null;
+    }
+
+    function readRate(text) {
+        // A letöltött HTML-t csak adatként olvassuk, nem illesztjük az oldalba.
+        const doc = new DOMParser().parseFromString(text, 'text/html');
+        const months = ['január', 'február', 'március', 'április', 'május', 'június',
+            'július', 'augusztus', 'szeptember', 'október', 'november', 'december'];
+        for (const table of doc.querySelectorAll('table')) {
+            const caption = table.querySelector('caption')?.textContent || '';
+            const match = caption.match(/Napi árfolyamok:\s*(\d{4})\.\s*([a-záéíóöőúüű]+)\s+(\d{1,2})\./i);
+            if (!match) continue;
+            const month = months.indexOf(match[2].toLowerCase()) + 1;
+            if (!month || Number(match[3]) < 1 || Number(match[3]) > 31) continue;
+            const date = `${match[1]}-${String(month).padStart(2, '0')}-${match[3].padStart(2, '0')}`;
+            for (const tr of table.querySelectorAll('tr')) {
+                const cells = [...tr.querySelectorAll('td')].map(td => td.textContent.trim());
+                if (cells.length !== 4 || cells[0] !== 'EUR') continue;
+                const unit = Number(cells[2]);
+                const value = Number(cells[3].replace(/\s/g, '').replace(',', '.')) / unit;
+                if (!Number.isFinite(value) || value <= 0 || unit <= 0) throw new Error('Érvénytelen EUR-árfolyam.');
+                return { value, date, fetchedAt: Date.now() };
+            }
+        }
+        throw new Error('Az MNB napi táblázata vagy EUR sora nem található.');
+    }
+
+    function render() {
+        scheduled = false;
+        for (const [source, row] of rows) {
+            if (!source.isConnected || !source.matches('.hwt-meta') || !amounts(source.textContent)) {
+                row.remove();
+                rows.delete(source);
+            }
+        }
+        for (const source of document.querySelectorAll(`.hwt-meta:not(.${CLASS})`)) {
+            const values = amounts(source.textContent);
+            if (!values) continue;
+            let row = rows.get(source);
+            if (!row) {
+                row = document.createElement('div');
+                row.className = `${source.className} ${CLASS}`;
+                // Átvesszük a Vue komponens stílusazonosítóját, de az eredeti elemet nem módosítjuk.
+                for (const attr of source.attributes) {
+                    if (attr.name.startsWith('data-v-')) row.setAttribute(attr.name, attr.value);
+                }
+                // Ugyanazokat a weboldali stílusokat használjuk, mint az eurós sor.
+                row.style.cssText = source.style.cssText;
+                rows.set(source, row);
+            }
+            if (source.nextElementSibling !== row) source.after(row);
+            const stale = rate && (failed || Date.now() - rate.fetchedAt > 2 * HOUR);
+            const text = rate
+                ? `${format.format(values[0] * rate.value)} Ft/hó · ${format.format(values[1] * rate.value)} Ft/nap${stale ? ' ⚠' : ''}`
+                : failed ? `MNB: ${lastError} Újrapróbálkozás 5 perc múlva.` : 'MNB-árfolyam betöltése…';
+            const title = rate
+                ? `MNB középárfolyam (${rate.date}): 1 EUR = ${format.format(rate.value)} Ft.${stale ? ' A frissítés nem sikerült vagy esedékes; a legutóbb mentett adat látható.' : ''}`
+                : 'Az MNB legutolsó közzétett EUR/HUF árfolyama alapján.';
+            if (row.textContent !== text) row.textContent = text;
+            if (row.title !== title) row.title = title;
+        }
+        const message = rows.size
+            ? ''
+            : 'Kryptex HUF 1.2 fut, de nem találja a .hwt-meta eurós havi/napi sorát. Nyisd meg a Hardware dashboardot EUR pénznemmel.';
+        if (status.textContent !== message) status.textContent = message;
+        const display = rows.size ? 'none' : 'block';
+        if (status.style.display !== display) status.style.display = display;
+    }
+
+    function schedule() {
+        if (!scheduled) {
+            scheduled = true;
+            setTimeout(render, 100);
+        }
+    }
+
+    function refresh() {
+        if (busy || Date.now() < nextAttempt ||
+            (rate && Date.now() - rate.fetchedAt < HOUR)) return;
+        busy = true;
+        const failure = error => {
+            busy = false;
+            failed = true;
+            lastError = error instanceof Error ? error.message : String(error);
+            nextAttempt = Date.now() + 5 * 60 * 1000;
+            console.warn('[Kryptex MNB HUF]', error);
+            schedule();
+        };
+        try {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: 'https://www.mnb.hu/arfolyamok',
+                anonymous: true,
+                timeout: 20000,
+                onload(response) {
+                    try {
+                        if (response.status !== 200) throw new Error(`MNB HTTP ${response.status}`);
+                        rate = readRate(response.responseText);
+                        try { GM_setValue(KEY, rate); }
+                        catch (error) { console.warn('[Kryptex MNB HUF] Az árfolyam nem menthető.', error); }
+                        busy = false;
+                        failed = false;
+                        nextAttempt = 0;
+                        schedule();
+                    } catch (error) { failure(error); }
+                },
+                onerror: () => failure('Hálózati hiba vagy hiányzó MNB-hozzáférés.'),
+                ontimeout: () => failure('Az MNB nem válaszolt időben.'),
+                onabort: () => failure('Megszakadt az MNB-lekérdezés.')
+            });
+        } catch (error) { failure(error); }
+    }
+
+    new MutationObserver(schedule).observe(document.body, {
+        childList: true, subtree: true, characterData: true
+    });
+    render();
+    refresh();
+    setInterval(() => { refresh(); schedule(); }, 60 * 1000);
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) { refresh(); schedule(); }
+    });
+})();
